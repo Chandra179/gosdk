@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to create secrets for Kafka and Temporal TLS certificates
+# Script to create secrets for Kafka TLS certificates
 # This script generates self-signed certificates for local development
 
 set -e
@@ -60,10 +60,6 @@ fi
 generate_cert "kafka"
 echo ""
 
-# Generate Temporal certificates
-generate_cert "temporal"
-echo ""
-
 # Create a README in the secrets directory
 cat > "$SECRETS_DIR/README.md" << 'EOF'
 # Secrets Directory
@@ -81,11 +77,6 @@ The `.gitignore` file is configured to ignore all files in this directory except
 - `kafka_key.pem` - Kafka private key
 - `kafka_ca.pem` - Kafka Certificate Authority
 
-### Temporal Certificates
-- `temporal_cert.pem` - Temporal client certificate
-- `temporal_key.pem` - Temporal private key
-- `temporal_ca.pem` - Temporal Certificate Authority
-
 ## Environment Variables
 
 Update your `.env` file with the correct paths:
@@ -95,11 +86,6 @@ Update your `.env` file with the correct paths:
 KAFKA_TLS_CERT_FILE=./secrets/kafka_cert.pem
 KAFKA_TLS_KEY_FILE=./secrets/kafka_key.pem
 KAFKA_TLS_CA_FILE=./secrets/kafka_ca.pem
-
-# Temporal TLS configuration
-TEMPORAL_TLS_CERT_FILE=./secrets/temporal_cert.pem
-TEMPORAL_TLS_KEY_FILE=./secrets/temporal_key.pem
-TEMPORAL_TLS_CA_FILE=./secrets/temporal_ca.pem
 ```
 
 ## Production Use
@@ -119,6 +105,3 @@ echo -e "${YELLOW}Note: Update your .env file to use these certificates:${NC}"
 echo "  KAFKA_TLS_CERT_FILE=./secrets/kafka_cert.pem"
 echo "  KAFKA_TLS_KEY_FILE=./secrets/kafka_key.pem"
 echo "  KAFKA_TLS_CA_FILE=./secrets/kafka_ca.pem"
-echo "  TEMPORAL_TLS_CERT_FILE=./secrets/temporal_cert.pem"
-echo "  TEMPORAL_TLS_KEY_FILE=./secrets/temporal_key.pem"
-echo "  TEMPORAL_TLS_CA_FILE=./secrets/temporal_ca.pem"

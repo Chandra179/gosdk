@@ -10,8 +10,6 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      vault-agent:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       kafka:
@@ -20,23 +18,14 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_started
-      temporal:
-        condition: service_healthy
     env_file:
       - .env
     environment:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
-      # Values from internal/cfg/kafka.yaml (broker address for Docker network)
       KAFKA_BROKERS: kafka:9092
       RABBITMQ_HOST: rabbitmq
-      TEMPORAL_HOST: temporal
       OTEL_EXPORTER_OTLP_ENDPOINT: alloy:4317
-      # Vault configuration
-      VAULT_ADDR: http://vault:8200
-    volumes:
-      - vault-secrets:/vault/secrets:ro
-      - vault-token:/vault/token:ro
     networks:
       - app-network
       - monitoring

@@ -18,11 +18,10 @@ type Service struct {
 	userRepo      *UserRepository
 }
 
-func NewService(oauth2Manager *oauth2.Manager, sessionStore session.Client, database db.SQLExecutor) *Service {
+func NewService(sessionStore session.Client, database db.SQLExecutor) *Service {
 	return &Service{
-		oauth2Manager: oauth2Manager,
-		sessionStore:  sessionStore,
-		userRepo:      NewUserRepository(database),
+		sessionStore: sessionStore,
+		userRepo:     NewUserRepository(database),
 	}
 }
 

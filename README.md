@@ -1,149 +1,196 @@
-# Go Template Project
+[![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/golang-migrate/migrate/ci.yaml?branch=master)](https://github.com/golang-migrate/migrate/actions/workflows/ci.yaml?query=branch%3Amaster)
+[![GoDoc](https://pkg.go.dev/badge/github.com/golang-migrate/migrate)](https://pkg.go.dev/github.com/golang-migrate/migrate/v4)
+[![Coverage Status](https://img.shields.io/coveralls/github/golang-migrate/migrate/master.svg)](https://coveralls.io/github/golang-migrate/migrate?branch=master)
+[![packagecloud.io](https://img.shields.io/badge/deb-packagecloud.io-844fec.svg)](https://packagecloud.io/golang-migrate/migrate?filter=debs)
+[![Docker Pulls](https://img.shields.io/docker/pulls/migrate/migrate.svg)](https://hub.docker.com/r/migrate/migrate/)
+![Supported Go Versions](https://img.shields.io/badge/Go-1.24%2C%201.25-lightgrey.svg)
+[![GitHub Release](https://img.shields.io/github/release/golang-migrate/migrate.svg)](https://github.com/golang-migrate/migrate/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/golang-migrate/migrate/v4)](https://goreportcard.com/report/github.com/golang-migrate/migrate/v4)
 
-This project is a Go template demonstrating reusable packages and runnable example services.
+# migrate
 
-## API (Swagger)
-```
-http://localhost:8080/swagger/index.html
-```
+__Database migrations written in Go. Use as [CLI](#cli-usage) or import as [library](#use-in-your-go-project).__
 
-## Project Structure
-```
-├── cmd/                               # Runnable applications
-│   └── myapp/                         # Main application
-│       └── main.go                    # Entry point
-│
-├── internal/                          # Internal services (not importable externally)
-│   ├── app/                           # Application initialization
-│   │   ├── bootstrap/                 # Component initialization (DB, cache, OAuth2, Kafka, OTEL)
-│   │   │   ├── cache.go               # Redis cache initialization
-│   │   │   ├── database.go            # Database connection setup
-│   │   │   ├── migrations.go          # Database migrations
-│   │   │   ├── oauth2.go              # OAuth2 provider setup
-│   │   │   └── otel.go                # OpenTelemetry setup
-│   │   ├── health/                    # Health check endpoints
-│   │   │   └── checker.go             # Health check implementation
-│   │   ├── middleware/                # HTTP middleware (auth, logging, request ID, CORS)
-│   │   │   ├── auth.go                # Authentication middleware
-│   │   │   ├── cors.go                # CORS middleware
-│   │   │   ├── logging.go             # Request logging middleware
-│   │   │   └── request_id.go          # Request ID middleware
-│   │   ├── routes/                    # HTTP route setup
-│   │   │   ├── auth.go                # Auth routes
-│   │   │   └── infra.go               # Infrastructure routes (health, metrics)
-│   │   ├── server.go                  # Server setup, lifecycle management
-│   │   └── provider.go                # Dependency injection provider
-│   ├── db/                            # Database layer
-│   │   ├── gen/                       # sqlc generated code
-│   │   │   ├── db.go                  # Database interface
-│   │   │   ├── models.go              # Data models
-│   │   │   ├── querier.go             # Query interface
-│   │   │   └── users.sql.go           # Generated user queries
-│   │   ├── migrations/                # SQL migration files
-│   │   │   ├── 000001_users_and_oidc.up.sql
-│   │   │   └── 000001_users_and_oidc.down.sql
-│   │   ├── queries/                   # SQL query files for sqlc
-│   │   │   └── users.sql
-│   │   ├── embed.go                   # Embedded migrations
-│   │   └── README.md                  # Database documentation
-│   ├── service/                       # Domain services
-│   │   ├── auth/                      # Authentication service
-│   │   │   ├── handler.go             # HTTP handlers (Gin)
-│   │   │   ├── repository.go          # Data access layer
-│   │   │   ├── service.go             # Business logic
-│   │   │   └── types.go               # DTOs and models
-│   │   └── session/                   # Session service
-│   │       ├── client.go              # Session client interface
-│   │       ├── redis_session.go       # Redis session implementation
-│   │       └── redis_session_test.go  # Session tests
-│   └── cfg/                           # Centralized config loading
-│       ├── config.go                  # Main config loader
-│       ├── http.go                    # HTTP server config
-│       ├── kafka.go                   # Kafka config
-│       ├── kafka.yaml                 # Kafka config YAML
-│       ├── loader.go                  # Config file loading
-│       ├── oauth.go                   # OAuth2 config
-│       ├── otel.go                    # OpenTelemetry config
-│       ├── postgres.go                # PostgreSQL config
-│       ├── postgres.yaml              # PostgreSQL config YAML
-│       ├── rabbitmq.go                # RabbitMQ config
-│       ├── rabbitmq.yaml              # RabbitMQ config YAML
-│       └── redis.go                   # Redis config
-│
-├── api/                               # API specifications
-│   ├── docs.go                        # Swagger documentation
-│   ├── swagger.yaml                   # OpenAPI spec
-│   └── swagger.json                   # OpenAPI spec (JSON)
-│
-├── scripts/                           # Utility scripts
-│   ├── create-secrets.sh              # Secrets creation script
-│   └── install.sh                     # Installation script
-│
-├── secrets/                           # Secrets configuration
-├── img/                               # Documentation images
-│
-├── Makefile                           # Build commands
-├── sqlc.yaml                          # sqlc configuration for type-safe SQL
-├── docker-compose.yml                 # Local services
-├── Dockerfile                         # Container image
-├── api.http                           # API testing file
-├── .env.example                       # Environment variables template
-├── .golangci.yml                      # GolangCI Linter config
-├── go.mod                             # Go module definition
-├── go.sum                             # Go dependencies checksum
-└── opencode.json                      # OpenCode configuration
-```
+* Migrate reads migrations from [sources](#migration-sources)
+   and applies them in correct order to a [database](#databases).
+* Drivers are "dumb", migrate glues everything together and makes sure the logic is bulletproof.
+   (Keeps the drivers lightweight, too.)
+* Database drivers don't assume things or try to correct user input. When in doubt, fail.
 
-## OpenTelemetry
+Forked from [mattes/migrate](https://github.com/mattes/migrate)
 
-This project implements a comprehensive observability stack using OpenTelemetry (OTEL) for distributed tracing, metrics, and logging.
+## Databases
 
-![Otel architecture](img/otel_arch.png)
+Database drivers run migrations. [Add a new database?](database/driver.go)
 
-1. **Metrics**: Application → OTLP Receiver → Batch Processor → Prometheus Exporter → Prometheus (via remote_write)
-2. **Docker Logs**: Application (Zerolog JSON) → Docker stdout → Alloy Docker Log Scraper → Loki Process → Loki Write → Loki
+* [PostgreSQL](database/postgres)
+* [PGX v4](database/pgx)
+* [PGX v5](database/pgx/v5)
+* [Redshift](database/redshift)
+* [Ql](database/ql)
+* [Cassandra / ScyllaDB](database/cassandra)
+* [SQLite](database/sqlite)
+* [SQLite3](database/sqlite3) ([todo #165](https://github.com/mattes/migrate/issues/165))
+* [SQLCipher](database/sqlcipher)
+* [MySQL / MariaDB](database/mysql)
+* [Neo4j](database/neo4j)
+* [MongoDB](database/mongodb)
+* [CrateDB](database/crate) ([todo #170](https://github.com/mattes/migrate/issues/170))
+* [Shell](database/shell) ([todo #171](https://github.com/mattes/migrate/issues/171))
+* [Google Cloud Spanner](database/spanner)
+* [CockroachDB](database/cockroachdb)
+* [YugabyteDB](database/yugabytedb)
+* [ClickHouse](database/clickhouse)
+* [Firebird](database/firebird)
+* [MS SQL Server](database/sqlserver)
+* [rqlite](database/rqlite)
 
+### Database URLs
 
+Database connection strings are specified via URLs. The URL format is driver dependent but generally has the form: `dbdriver://username:password@host:port/dbname?param1=true&param2=false`
 
+Any [reserved URL characters](https://en.wikipedia.org/wiki/Percent-encoding#Percent-encoding_reserved_characters) need to be escaped. Note, the `%` character also [needs to be escaped](https://en.wikipedia.org/wiki/Percent-encoding#Percent-encoding_the_percent_character)
 
-## Database & SQL Code Generation (sqlc)
+Explicitly, the following characters need to be escaped:
+`!`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `*`, `+`, `,`, `/`, `:`, `;`, `=`, `?`, `@`, `[`, `]`
 
-This project uses **[sqlc](https://docs.sqlc.dev/)** for type-safe SQL code generation. sqlc generates Go code from SQL queries, providing compile-time safety and eliminating the need for ORMs.
-
-### Generating Code
-
-After modifying SQL queries or schema, regenerate Go code:
+It's easiest to always run the URL parts of your DB connection URL (e.g. username, password, etc) through an URL encoder. See the example Python snippets below:
 
 ```bash
-sqlc generate
+$ python3 -c 'import urllib.parse; print(urllib.parse.quote(input("String to encode: "), ""))'
+String to encode: FAKEpassword!#$%&'()*+,/:;=?@[]
+FAKEpassword%21%23%24%25%26%27%28%29%2A%2B%2C%2F%3A%3B%3D%3F%40%5B%5D
+$ python2 -c 'import urllib; print urllib.quote(raw_input("String to encode: "), "")'
+String to encode: FAKEpassword!#$%&'()*+,/:;=?@[]
+FAKEpassword%21%23%24%25%26%27%28%29%2A%2B%2C%2F%3A%3B%3D%3F%40%5B%5D
+$
 ```
 
+## Migration Sources
 
+Source drivers read migrations from local or remote sources. [Add a new source?](source/driver.go)
 
+* [Filesystem](source/file) - read from filesystem
+* [io/fs](source/iofs) - read from a Go [io/fs](https://pkg.go.dev/io/fs#FS)
+* [Go-Bindata](source/go_bindata) - read from embedded binary data ([jteeuwen/go-bindata](https://github.com/jteeuwen/go-bindata))
+* [pkger](source/pkger) - read from embedded binary data ([markbates/pkger](https://github.com/markbates/pkger))
+* [GitHub](source/github) - read from remote GitHub repositories
+* [GitHub Enterprise](source/github_ee) - read from remote GitHub Enterprise repositories
+* [Bitbucket](source/bitbucket) - read from remote Bitbucket repositories
+* [Gitlab](source/gitlab) - read from remote Gitlab repositories
+* [AWS S3](source/aws_s3) - read from Amazon Web Services S3
+* [Google Cloud Storage](source/google_cloud_storage) - read from Google Cloud Platform Storage
 
-## Kafka Architecture
+## CLI usage
 
-The project provides a robust Kafka client implementation using [franz-go](https://github.com/twmb/franz-go) with OpenTelemetry integration for observability.
+* Simple wrapper around this library.
+* Handles ctrl+c (SIGINT) gracefully.
+* No config search paths, no config files, no magic ENV var injections.
 
-![Kafka architecture](img/kafka_arch.png)
+[CLI Documentation](cmd/migrate) (includes CLI install instructions)
 
+### Basic usage
 
+```bash
+$ migrate -source file://path/to/migrations -database postgres://localhost:5432/database up 2
+```
 
+### Docker usage
 
+```bash
+$ docker run -v {{ migration dir }}:/migrations --network host migrate/migrate
+    -path=/migrations/ -database postgres://localhost:5432/database up 2
+```
 
-## RabbitMQ Architecture
+## Use in your Go project
 
-The project provides a robust RabbitMQ client AMQP implementation with automatic reconnection, channel pooling, and Dead Letter Exchange (DLX) support for reliable message processing.
+* API is stable and frozen for this release (v3 & v4).
+* Uses [Go modules](https://golang.org/cmd/go/#hdr-Modules__module_versions__and_more) to manage dependencies.
+* To help prevent database corruptions, it supports graceful stops via `GracefulStop chan bool`.
+* Bring your own logger.
+* Uses `io.Reader` streams internally for low memory overhead.
+* Thread-safe and no goroutine leaks.
 
+__[Go Documentation](https://pkg.go.dev/github.com/golang-migrate/migrate/v4)__
 
+```go
+import (
+    "github.com/golang-migrate/migrate/v4"
+    _ "github.com/golang-migrate/migrate/v4/database/postgres"
+    _ "github.com/golang-migrate/migrate/v4/source/github"
+)
 
+func main() {
+    m, err := migrate.New(
+        "github://mattes:personal-access-token@mattes/migrate_test",
+        "postgres://localhost:5432/database?sslmode=enable")
+    m.Steps(2)
+}
+```
 
+Want to use an existing database client?
 
+```go
+import (
+    "database/sql"
+    _ "github.com/lib/pq"
+    "github.com/golang-migrate/migrate/v4"
+    "github.com/golang-migrate/migrate/v4/database/postgres"
+    _ "github.com/golang-migrate/migrate/v4/source/file"
+)
 
-### Data Flow
+func main() {
+    db, err := sql.Open("postgres", "postgres://localhost:5432/database?sslmode=enable")
+    driver, err := postgres.WithInstance(db, &postgres.Config{})
+    m, err := migrate.NewWithDatabaseInstance(
+        "file:///migrations",
+        "postgres", driver)
+    m.Up() // or m.Steps(2) if you want to explicitly set the number of migrations to run
+}
+```
 
-1. **Publishing**: Application → Producer → Publisher Channel Pool → RabbitMQ Exchange
-2. **Consuming**: RabbitMQ Queue → Consumer Channel Pool → Message Handler → ACK/NACK
-3. **Error Handling**: Failed messages → Retry Queue (with TTL) → Main Queue → Parking Lot
+## Getting started
 
-For detailed usage and configuration, see [internal/cfg/rabbitmq.go](internal/cfg/rabbitmq.go).
+Go to [getting started](GETTING_STARTED.md)
+
+## Tutorials
+
+* [CockroachDB](database/cockroachdb/TUTORIAL.md)
+* [PostgreSQL](database/postgres/TUTORIAL.md)
+
+(more tutorials to come)
+
+## Migration files
+
+Each migration has an up and down migration. [Why?](FAQ.md#why-two-separate-files-up-and-down-for-a-migration)
+
+```bash
+1481574547_create_users_table.up.sql
+1481574547_create_users_table.down.sql
+```
+
+[Best practices: How to write migrations.](MIGRATIONS.md)
+
+## Coming from another db migration tool?
+
+Check out [migradaptor](https://github.com/musinit/migradaptor/).
+*Note: migradaptor is not affiliated or supported by this project*
+
+## Versions
+
+Version | Supported? | Import | Notes
+--------|------------|--------|------
+**master** | :white_check_mark: | `import "github.com/golang-migrate/migrate/v4"` | New features and bug fixes arrive here first |
+**v4** | :white_check_mark: | `import "github.com/golang-migrate/migrate/v4"` | Used for stable releases |
+**v3** | :x: | `import "github.com/golang-migrate/migrate"` (with package manager) or `import "gopkg.in/golang-migrate/migrate.v3"` (not recommended) | **DO NOT USE** - No longer supported |
+
+## Development and Contributing
+
+Yes, please! [`Makefile`](Makefile) is your friend,
+read the [development guide](CONTRIBUTING.md).
+
+Also have a look at the [FAQ](FAQ.md).
+
+---
+
+Looking for alternatives? [https://awesome-go.com/#database](https://awesome-go.com/#database).

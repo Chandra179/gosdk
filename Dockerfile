@@ -1,29 +1,26 @@
-FROM golang:latest AS builder
+FROM golang:1.26.1-alpine AS builder
+
+RUN apk add --no-cache git
 
 WORKDIR /app
 
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor/ vendor/
 
+# No network needed — all deps are in vendor/
 COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -mod=vendor -v -o main ./cmd/myapp
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -o main ./cmd/myapp
-
+# Final Stage
 FROM alpine:latest
-
-# Use --no-cache to keep the image small
 RUN apk add --no-cache libc6-compat
-
 WORKDIR /app
 
-# Copy binary from builder
 COPY --from=builder /app/main .
 COPY --from=builder /app/internal/db/migrations ./db/migrations
 COPY --from=builder /app/internal/cfg/*.yaml ./internal/cfg/
 
-# Expose App ports
 EXPOSE 8080 9090
 
-# Run the application
 CMD ["./main"]

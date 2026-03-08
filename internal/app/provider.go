@@ -98,15 +98,14 @@ func NewProvider(ctx context.Context, config *cfg.Config) (*Provider, error) {
 
 	// Create auth service with OAuth2 callback handler
 	// Note: We pass nil for OAuth2 manager initially, it will be set after OAuth2 initialization
-	authService := auth.NewService(nil, sessionStore, infra.DB)
+	authService := auth.NewService(sessionStore, infra.DB)
 	oauth2Manager, err := bootstrap.InitOAuth2(ctx, &config.OAuth2, authService.OAuthCallbackHandler())
 	if err != nil {
-		infra.Close(ctx) // Clean up on failure
-		return nil, fmt.Errorf("oauth2 initialization: %w", err)
+		// return nil, fmt.Errorf("oauth2 initialization: %w", err)
+	} else {
+		infra.OAuth2Manager = oauth2Manager
+		authService.SetOAuth2Manager(oauth2Manager)
 	}
-	infra.OAuth2Manager = oauth2Manager
-
-	authService.SetOAuth2Manager(oauth2Manager)
 
 	services := &Services{
 		Auth:    authService,

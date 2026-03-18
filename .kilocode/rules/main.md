@@ -1,1 +1,0 @@
-If the user mentions 'config', prioritize the instructions in config_rules.md.if the user mentions 'infra' prioritize the instructions in infra_rules.md

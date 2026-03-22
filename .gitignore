@@ -44,3 +44,4 @@ secrets/*
 
 # Binary installations
 bin/golangci-lint
+**/vendor/

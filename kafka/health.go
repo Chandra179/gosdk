@@ -20,19 +20,18 @@ type ClusterHealth struct {
 	ErrorMessage string
 }
 
-// HealthChecker provides health check functionality for Kafka.
-type HealthChecker struct {
+// healthChecker implements the HealthChecker interface.
+type healthChecker struct {
 	client *kgo.Client
 }
 
 // NewHealthChecker creates a new HealthChecker.
-func NewHealthChecker(client *kgo.Client) *HealthChecker {
-	return &HealthChecker{client: client}
+func NewHealthChecker(client *kgo.Client) HealthChecker {
+	return &healthChecker{client: client}
 }
 
 // Check performs a basic health check by pinging the cluster.
-// Returns nil if the cluster is reachable and healthy.
-func (h *HealthChecker) Check(ctx context.Context) error {
+func (h *healthChecker) Check(ctx context.Context) error {
 	health, err := h.CheckWithMetadata(ctx)
 	if err != nil {
 		return err
@@ -44,13 +43,12 @@ func (h *HealthChecker) Check(ctx context.Context) error {
 }
 
 // CheckWithMetadata performs a health check and returns detailed cluster information.
-func (h *HealthChecker) CheckWithMetadata(ctx context.Context) (*ClusterHealth, error) {
+func (h *healthChecker) CheckWithMetadata(ctx context.Context) (*ClusterHealth, error) {
 	start := time.Now()
 	health := &ClusterHealth{}
 
 	adminClient := kadm.NewClient(h.client)
 
-	// Get cluster metadata
 	metadata, err := adminClient.Metadata(ctx)
 	if err != nil {
 		health.Healthy = false
@@ -65,14 +63,12 @@ func (h *HealthChecker) CheckWithMetadata(ctx context.Context) (*ClusterHealth, 
 	health.BrokerCount = len(metadata.Brokers)
 	health.TopicCount = len(metadata.Topics)
 
-	// Check if we have at least one broker
 	if health.BrokerCount == 0 {
 		health.Healthy = false
 		health.ErrorMessage = "no brokers available"
 		return health, nil
 	}
 
-	// Check if controller is valid
 	if health.ControllerID < 0 {
 		health.Healthy = false
 		health.ErrorMessage = "no controller elected"
@@ -84,9 +80,7 @@ func (h *HealthChecker) CheckWithMetadata(ctx context.Context) (*ClusterHealth, 
 }
 
 // LivenessCheck is a convenience function for Kubernetes liveness probes.
-// It performs a lightweight check to verify the client is still connected.
-func (h *HealthChecker) LivenessCheck(ctx context.Context) error {
-	// Use a short timeout for liveness checks
+func (h *healthChecker) LivenessCheck(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 

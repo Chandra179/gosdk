@@ -19,25 +19,25 @@ type Message struct {
 	Callback func(*kgo.Record, error)
 }
 
-// Producer wraps a Kafka client for producing messages.
-type Producer struct {
+// producer implements the Producer interface.
+type producer struct {
 	client *kgo.Client
 	logger *slog.Logger
 }
 
-// ProducerOption configures a Producer.
-type ProducerOption func(*Producer)
+// ProducerOption configures a producer.
+type ProducerOption func(*producer)
 
 // WithProducerLogger sets the logger for the producer.
 func WithProducerLogger(logger *slog.Logger) ProducerOption {
-	return func(p *Producer) {
+	return func(p *producer) {
 		p.logger = logger
 	}
 }
 
 // NewProducer creates a new Producer with the given client and options.
-func NewProducer(client *kgo.Client, opts ...ProducerOption) *Producer {
-	p := &Producer{
+func NewProducer(client *kgo.Client, opts ...ProducerOption) Producer {
+	p := &producer{
 		client: client,
 		logger: slog.Default(),
 	}
@@ -48,7 +48,7 @@ func NewProducer(client *kgo.Client, opts ...ProducerOption) *Producer {
 }
 
 // Produce sends a message asynchronously.
-func (p *Producer) Produce(ctx context.Context, msg *Message) error {
+func (p *producer) Produce(ctx context.Context, msg *Message) error {
 	data, err := p.marshalPayload(msg.Payload)
 	if err != nil {
 		return err
@@ -84,12 +84,12 @@ func (p *Producer) Produce(ctx context.Context, msg *Message) error {
 }
 
 // SendMessage is a convenience method to send a message with just topic and payload.
-func (p *Producer) SendMessage(ctx context.Context, topic string, payload any) error {
+func (p *producer) SendMessage(ctx context.Context, topic string, payload any) error {
 	return p.Produce(ctx, &Message{Topic: topic, Payload: payload})
 }
 
 // SendToDLQ sends a message to the dead letter queue asynchronously.
-func (p *Producer) SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error {
+func (p *producer) SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error {
 	dlqTopic := originalTopic + ".dlq"
 
 	headers := map[string]string{
@@ -111,7 +111,7 @@ func (p *Producer) SendToDLQ(ctx context.Context, originalTopic string, value []
 	})
 }
 
-func (p *Producer) marshalPayload(payload any) ([]byte, error) {
+func (p *producer) marshalPayload(payload any) ([]byte, error) {
 	if b, ok := payload.([]byte); ok {
 		return b, nil
 	}

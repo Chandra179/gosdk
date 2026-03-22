@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,6 +12,32 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 	"github.com/twmb/franz-go/plugin/kotel"
 )
+
+// Sentinel errors for the kafka package.
+var (
+	ErrProducerClosed = errors.New("kafka: producer is closed")
+	ErrConsumerClosed = errors.New("kafka: consumer is closed")
+)
+
+// Producer produces messages to Kafka topics.
+type Producer interface {
+	Produce(ctx context.Context, msg *Message) error
+	SendMessage(ctx context.Context, topic string, payload any) error
+	SendToDLQ(ctx context.Context, originalTopic string, value []byte, key []byte, dlqErr error) error
+}
+
+// Consumer consumes messages from Kafka topics.
+// Start blocks until the context is cancelled, the client is closed, or a fatal error occurs.
+type Consumer interface {
+	Start(ctx context.Context, handler func(*kgo.Record) error) error
+}
+
+// HealthChecker provides health check functionality for Kafka.
+type HealthChecker interface {
+	Check(ctx context.Context) error
+	CheckWithMetadata(ctx context.Context) (*ClusterHealth, error)
+	LivenessCheck(ctx context.Context) error
+}
 
 // NewKafkaClient creates a Kafka client with the provided configuration.
 // Deprecated: Use NewKafkaClientFromConfig for production use.
@@ -146,6 +173,7 @@ func buildSASLOpt(cfg *Config) (kgo.Opt, error) {
 	}
 }
 
+// SlogShim adapts *slog.Logger to the kgo.Logger interface.
 type SlogShim struct {
 	L *slog.Logger
 }

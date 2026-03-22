@@ -18,17 +18,21 @@ const CommitRecord CommitMode = iota
 
 // ConsumerOptions configures consumer behavior.
 type ConsumerOptions struct {
-	DLQProducer  *Producer
+	DLQProducer  Producer
 	OnDLQPublish func(topic string, err error)
 	MaxRetries   int
 	RetryBackoff time.Duration
 	Logger       *slog.Logger
-	GroupID      string
 }
 
-// StartConsumer starts consuming messages and processing them with the handler.
-// It blocks until the context is cancelled or an error occurs.
-func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, opts ...ConsumerOptions) error {
+// consumer implements the Consumer interface.
+type consumer struct {
+	client  *kgo.Client
+	options ConsumerOptions
+}
+
+// NewConsumer creates a new Consumer with the given client and options.
+func NewConsumer(client *kgo.Client, opts ...ConsumerOptions) Consumer {
 	options := ConsumerOptions{
 		MaxRetries:   3,
 		RetryBackoff: 100 * time.Millisecond,
@@ -44,21 +48,23 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 		if o.Logger != nil {
 			options.Logger = o.Logger
 		}
-		if o.GroupID != "" {
-			options.GroupID = o.GroupID
-		}
 		options.DLQProducer = o.DLQProducer
 		options.OnDLQPublish = o.OnDLQPublish
 	}
+	return &consumer{client: client, options: options}
+}
 
-	logger := options.Logger
+// Start begins consuming messages and processing them with the handler.
+// It blocks until the context is cancelled or the client is closed.
+func (c *consumer) Start(ctx context.Context, handler func(*kgo.Record) error) error {
+	logger := c.options.Logger
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		fetches := client.PollFetches(ctx)
+		fetches := c.client.PollFetches(ctx)
 
 		if fetches.IsClientClosed() {
 			return nil
@@ -76,15 +82,11 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 				return
 			}
 
-			start := time.Now()
 			var lastErr error
 
-			// Retry handler with exponential backoff
-			// Attempts: 0 (first try), 1 (first retry), 2 (second retry), etc.
-			// If all attempts fail, message is sent to DLQ
-			for attempt := 0; attempt <= options.MaxRetries; attempt++ {
+			for attempt := 0; attempt <= c.options.MaxRetries; attempt++ {
 				if attempt > 0 {
-					backoff := time.Duration(attempt) * options.RetryBackoff
+					backoff := time.Duration(attempt) * c.options.RetryBackoff
 					select {
 					case <-ctx.Done():
 						return
@@ -99,7 +101,7 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 						"partition", r.Partition,
 						"offset", r.Offset,
 						"attempt", attempt+1,
-						"max_retries", options.MaxRetries,
+						"max_retries", c.options.MaxRetries,
 						"error", err,
 					)
 					continue
@@ -108,13 +110,9 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 				break
 			}
 
-			duration := time.Since(start)
-			_ = duration
-
-			// All retries exhausted - send message to DLQ or log error
 			if lastErr != nil {
-				if options.DLQProducer != nil {
-					if err := options.DLQProducer.SendToDLQ(ctx, r.Topic, r.Value, r.Key, lastErr); err != nil {
+				if c.options.DLQProducer != nil {
+					if err := c.options.DLQProducer.SendToDLQ(ctx, r.Topic, r.Value, r.Key, lastErr); err != nil {
 						logger.Error("failed to send message to DLQ",
 							"error", err,
 							"topic", r.Topic,
@@ -130,8 +128,8 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 							"dlq_topic", r.Topic+".dlq",
 							"error", lastErr,
 						)
-						if options.OnDLQPublish != nil {
-							options.OnDLQPublish(r.Topic, lastErr)
+						if c.options.OnDLQPublish != nil {
+							c.options.OnDLQPublish(r.Topic, lastErr)
 						}
 					}
 				} else {
@@ -144,17 +142,23 @@ func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Re
 				}
 			}
 
-			// Per-record commit ensures at-least-once delivery - messages are only committed after successful processing.
-			if err := client.CommitRecords(ctx, r); err != nil {
+			if err := c.client.CommitRecords(ctx, r); err != nil {
 				logger.Error("commit error", "error", err)
 			}
 		})
-
 	}
 }
 
+// StartConsumer starts consuming messages and processing them with the handler.
+// Deprecated: Use NewConsumer and Consumer.Start instead.
+func StartConsumer(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, opts ...ConsumerOptions) error {
+	c := NewConsumer(client, opts...)
+	return c.Start(ctx, handler)
+}
+
 // StartConsumerWithDLQ is a convenience function to start a consumer with DLQ support.
-func StartConsumerWithDLQ(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, dlqProducer *Producer) error {
+// Deprecated: Use NewConsumer with ConsumerOptions.DLQProducer instead.
+func StartConsumerWithDLQ(ctx context.Context, client *kgo.Client, handler func(*kgo.Record) error, dlqProducer Producer) error {
 	return StartConsumer(ctx, client, handler, ConsumerOptions{
 		DLQProducer: dlqProducer,
 		MaxRetries:  3,

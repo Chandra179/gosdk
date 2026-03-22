@@ -5,6 +5,25 @@ import (
 	"time"
 )
 
+// Manager defines the interface for the OAuth2 manager.
+// Implementations must be safe for concurrent use.
+type Manager interface {
+	// RegisterProvider registers a new authentication provider.
+	RegisterProvider(provider Provider)
+
+	// GetAuthURL generates an authorization URL with state, nonce, and PKCE for the named provider.
+	GetAuthURL(providerName string) (string, error)
+
+	// HandleCallback handles the OAuth2/OIDC callback and invokes the configured callback handler.
+	HandleCallback(ctx context.Context, providerName, code, state string) (*CallbackInfo, error)
+
+	// GetProvider returns a registered provider by name.
+	GetProvider(providerName string) (Provider, error)
+
+	// Cleanup releases storage resources (e.g. stops background goroutines).
+	Cleanup()
+}
+
 // Provider defines the interface for OAuth2/OIDC authentication providers.
 // Implementations must be safe for concurrent use.
 type Provider interface {

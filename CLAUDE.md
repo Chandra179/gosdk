@@ -17,7 +17,6 @@ cd db/ && make test
 
 # Modules without a Makefile
 cd cache/ && go test -v -count=1 ./...
-cd oauth2/ && go test -v ./...
 cd logger/ && go test -v ./...
 ```
 
@@ -29,6 +28,7 @@ Each module follows this pattern:
 - **`client.go`** (or `<module>.go`) — public API: sentinel errors, interfaces, config structs. Keep the surface small.
 - **`impl.go`** / named files — unexported struct implementing the interface; only constructors are exported (e.g. `NewPostgresClient`).
 - **`example/`** — integration tests with `TestMain` starting infrastructure once via testcontainers; per-test cleanup via `t.Cleanup`.
+- **Makefile** - add `go test -tags integration -v -count=1 -timeout 300s ./...`
 
 ### Interface-first design
 

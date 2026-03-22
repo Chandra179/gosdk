@@ -44,8 +44,8 @@ func DefaultManagerConfig() *ManagerConfig {
 	}
 }
 
-// Manager manages OAuth2/OIDC providers and authentication flow
-type Manager struct {
+// manager implements the Manager interface.
+type manager struct {
 	mu              sync.RWMutex
 	providers       map[string]Provider
 	stateStorage    StateStorage
@@ -54,7 +54,7 @@ type Manager struct {
 }
 
 // NewManager creates a new manager with providers from configuration
-func NewManager(ctx context.Context, cfg *ManagerConfig) (*Manager, error) {
+func NewManager(ctx context.Context, cfg *ManagerConfig) (Manager, error) {
 	// Start with defaults
 	defaultCfg := DefaultManagerConfig()
 
@@ -72,7 +72,7 @@ func NewManager(ctx context.Context, cfg *ManagerConfig) (*Manager, error) {
 		return nil, fmt.Errorf("%w: callback handler is required", ErrCallbackHandler)
 	}
 
-	mgr := &Manager{
+	mgr := &manager{
 		providers:       make(map[string]Provider),
 		stateStorage:    NewInMemoryStorage(),
 		callbackHandler: cfg.CallbackHandler,
@@ -83,7 +83,7 @@ func NewManager(ctx context.Context, cfg *ManagerConfig) (*Manager, error) {
 }
 
 // NewManagerWithGoogle creates a new manager with Google provider configured
-func NewManagerWithGoogle(ctx context.Context, cfg *ManagerConfig, googleClientID, googleClientSecret, googleRedirectURL string) (*Manager, error) {
+func NewManagerWithGoogle(ctx context.Context, cfg *ManagerConfig, googleClientID, googleClientSecret, googleRedirectURL string) (Manager, error) {
 	mgr, err := NewManager(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -108,7 +108,7 @@ func NewManagerWithGoogle(ctx context.Context, cfg *ManagerConfig, googleClientI
 
 // RegisterProvider registers a new authentication provider
 // This method is safe for concurrent use
-func (m *Manager) RegisterProvider(provider Provider) {
+func (m *manager) RegisterProvider(provider Provider) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.providers[provider.GetName()] = provider
@@ -116,7 +116,7 @@ func (m *Manager) RegisterProvider(provider Provider) {
 
 // GetAuthURL generates authorization URL with state, nonce, and PKCE
 // This method is safe for concurrent use
-func (m *Manager) GetAuthURL(providerName string) (string, error) {
+func (m *manager) GetAuthURL(providerName string) (string, error) {
 	m.mu.RLock()
 	provider, exists := m.providers[providerName]
 	m.mu.RUnlock()
@@ -153,7 +153,7 @@ func (m *Manager) GetAuthURL(providerName string) (string, error) {
 // HandleCallback handles OAuth2/OIDC callback and invokes the callback handler
 // Returns userInfo, tokenSet, and any custom result from the callback handler
 // This method is safe for concurrent use
-func (m *Manager) HandleCallback(ctx context.Context, providerName, code, state string) (*CallbackInfo, error) {
+func (m *manager) HandleCallback(ctx context.Context, providerName, code, state string) (*CallbackInfo, error) {
 	m.mu.RLock()
 	provider, exists := m.providers[providerName]
 	m.mu.RUnlock()
@@ -171,8 +171,6 @@ func (m *Manager) HandleCallback(ctx context.Context, providerName, code, state 
 	// Note: We delete even if callback fails to prevent replay attacks
 	defer func() {
 		if err := m.stateStorage.DeleteState(state); err != nil {
-			// Log error but don't fail - state deletion failure doesn't invalidate successful auth
-			// This could happen if storage is temporarily unavailable
 			_ = err // Intentionally ignored - state cleanup is best effort
 		}
 	}()
@@ -193,7 +191,7 @@ func (m *Manager) HandleCallback(ctx context.Context, providerName, code, state 
 
 // GetProvider returns a provider by name
 // This method is safe for concurrent use
-func (m *Manager) GetProvider(providerName string) (Provider, error) {
+func (m *manager) GetProvider(providerName string) (Provider, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -205,6 +203,6 @@ func (m *Manager) GetProvider(providerName string) (Provider, error) {
 }
 
 // Cleanup cleans up storage resources
-func (m *Manager) Cleanup() {
+func (m *manager) Cleanup() {
 	m.stateStorage.Cleanup()
 }

@@ -43,7 +43,7 @@ func DefaultHandlerConfig() *HandlerConfig {
 // @Failure 401 {object} map[string]string "Unauthorized - invalid state or code"
 // @Failure 500 {object} map[string]string "Internal Server Error"
 // @Router /auth/callback/google [get]
-func GoogleCallbackHandler(manager *Manager, config *HandlerConfig) gin.HandlerFunc {
+func GoogleCallbackHandler(manager Manager, config *HandlerConfig) gin.HandlerFunc {
 	if config == nil {
 		config = DefaultHandlerConfig()
 	}
@@ -92,7 +92,7 @@ func GoogleCallbackHandler(manager *Manager, config *HandlerConfig) gin.HandlerF
 			config.CookiePath,
 			config.CookieDomain,
 			config.SecureCookies, // Secure: from config
-			false,                // HttpOnly: always true
+			true,                 // HttpOnly: always true
 		)
 
 		c.JSON(http.StatusOK, gin.H{

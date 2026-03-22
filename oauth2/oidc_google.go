@@ -18,9 +18,10 @@ type GoogleOIDCProvider struct {
 	providerName string
 }
 
-// NewGoogleOIDCProvider creates a new Google OIDC provider
-func NewGoogleOIDCProvider(ctx context.Context, clientID, clientSecret, redirectURL string, scopes []string) (*GoogleOIDCProvider, error) {
-	provider, err := oidc.NewProvider(ctx, "https://accounts.google.com")
+// NewOIDCProvider creates an OIDC provider for the given issuer URL.
+// Use this for custom or non-Google OIDC providers, or in tests with a mock server.
+func NewOIDCProvider(ctx context.Context, issuerURL, providerName, clientID, clientSecret, redirectURL string, scopes []string) (*GoogleOIDCProvider, error) {
+	provider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
 	}
@@ -45,9 +46,19 @@ func NewGoogleOIDCProvider(ctx context.Context, clientID, clientSecret, redirect
 		config:       config,
 		provider:     provider,
 		verifier:     verifier,
-		logoutURL:    "https://accounts.google.com/logout",
-		providerName: "google",
+		logoutURL:    issuerURL + "/logout",
+		providerName: providerName,
 	}, nil
+}
+
+// NewGoogleOIDCProvider creates a new Google OIDC provider
+func NewGoogleOIDCProvider(ctx context.Context, clientID, clientSecret, redirectURL string, scopes []string) (*GoogleOIDCProvider, error) {
+	p, err := NewOIDCProvider(ctx, "https://accounts.google.com", "google", clientID, clientSecret, redirectURL, scopes)
+	if err != nil {
+		return nil, err
+	}
+	p.logoutURL = "https://accounts.google.com/logout"
+	return p, nil
 }
 
 // GetName returns the provider name

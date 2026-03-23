@@ -3,8 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Producer handles message publishing with confirms and OTel tracing
+// Producer handles message publishing with confirms and OTel tracing.
 type Producer struct {
 	client *Client
 	tracer trace.Tracer
@@ -27,7 +27,7 @@ func NewProducer(client *Client) Publisher {
 	}
 }
 
-// PublishOptions contains options for publishing a message
+// PublishOptions contains options for publishing a message.
 type PublishOptions struct {
 	Exchange   string
 	RoutingKey string
@@ -36,38 +36,32 @@ type PublishOptions struct {
 	Headers    map[string]interface{}
 }
 
-// PublishMessage publishes a message to the specified exchange/routing key
+// PublishMessage publishes a message to the specified exchange/routing key.
 func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payload interface{}) error {
-	// Start a span for the publish operation
 	ctx, span := p.tracer.Start(ctx, "rabbitmq.publish",
-		trace.WithAttributes(
-		// Add standard messaging attributes
-		),
+		trace.WithAttributes(),
 	)
 	defer span.End()
 
-	// Serialize payload
 	body, err := json.Marshal(payload)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	// Get publisher confirms channel
-	ch, err := p.client.GetPublisherChannel()
+	ch, err := p.client.GetPublisherChannel(ctx)
 	if err != nil {
 		span.RecordError(err)
-		// Check if channel is closed, trigger reconnection and retry once
-		if strings.Contains(err.Error(), "channel is closed") {
-			p.client.triggerReconnect()
-			// Wait for reconnection with timeout (up to 10 seconds)
-			for i := 0; i < 20; i++ {
-				time.Sleep(500 * time.Millisecond)
-				if p.client.IsHealthy() {
-					break
-				}
+
+		// If disconnected, wait briefly for reconnection and retry once
+		if errors.Is(err, ErrNotConnected) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(p.client.config.ReconnectInitialInterval):
 			}
-			ch, err = p.client.GetPublisherChannel()
+
+			ch, err = p.client.GetPublisherChannel(ctx)
 			if err != nil {
 				span.RecordError(err)
 				return fmt.Errorf("failed to get publisher channel after retry: %w", err)
@@ -86,20 +80,17 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 		}
 	}
 
-	// Inject trace context into headers
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 	for k, v := range carrier {
 		headers[k] = v
 	}
 
-	// Determine delivery mode
 	deliveryMode := amqp.Transient
 	if p.client.config.PersistentDelivery {
 		deliveryMode = amqp.Persistent
 	}
 
-	// Set mandatory flag
 	mandatory := p.client.config.Mandatory
 	if opts.Mandatory {
 		mandatory = true
@@ -112,7 +103,6 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 		Headers:      headers,
 	}
 
-	// If publisher confirms are enabled, wait for confirmation
 	if p.client.config.PublisherConfirms {
 		confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 
@@ -129,7 +119,6 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 			return fmt.Errorf("failed to publish message: %w", err)
 		}
 
-		// Wait for confirmation
 		select {
 		case confirm := <-confirms:
 			if !confirm.Ack {
@@ -164,15 +153,15 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 	return nil
 }
 
-// SendMessage is a convenience method for sending to a direct queue
+// SendMessage is a convenience method for sending to a direct queue.
 func (p *Producer) SendMessage(ctx context.Context, queueName string, payload interface{}) error {
 	return p.PublishMessage(ctx, PublishOptions{
-		Exchange:   "", // Default exchange
+		Exchange:   "",
 		RoutingKey: queueName,
 	}, payload)
 }
 
-// SendMessageWithHeaders publishes a message with custom headers
+// SendMessageWithHeaders publishes a message with custom headers.
 func (p *Producer) SendMessageWithHeaders(ctx context.Context, queueName string, payload interface{}, headers map[string]interface{}) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   "",
@@ -181,7 +170,7 @@ func (p *Producer) SendMessageWithHeaders(ctx context.Context, queueName string,
 	}, payload)
 }
 
-// SendToTopic publishes a message to a topic exchange
+// SendToTopic publishes a message to a topic exchange.
 func (p *Producer) SendToTopic(ctx context.Context, exchange, routingKey string, payload interface{}) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   exchange,
@@ -189,7 +178,7 @@ func (p *Producer) SendToTopic(ctx context.Context, exchange, routingKey string,
 	}, payload)
 }
 
-// SendToTopicWithHeaders publishes a message to a topic exchange with custom headers
+// SendToTopicWithHeaders publishes a message to a topic exchange with custom headers.
 func (p *Producer) SendToTopicWithHeaders(ctx context.Context, exchange, routingKey string, payload interface{}, headers map[string]interface{}) error {
 	return p.PublishMessage(ctx, PublishOptions{
 		Exchange:   exchange,
@@ -198,7 +187,7 @@ func (p *Producer) SendToTopicWithHeaders(ctx context.Context, exchange, routing
 	}, payload)
 }
 
-// PublishBatch publishes multiple messages in a batch
+// PublishBatch publishes multiple messages in a batch.
 func (p *Producer) PublishBatch(ctx context.Context, opts PublishOptions, payloads []interface{}) error {
 	for i, payload := range payloads {
 		if err := p.PublishMessage(ctx, opts, payload); err != nil {

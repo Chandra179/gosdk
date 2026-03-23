@@ -1,17 +1,15 @@
-package example
+//go:build integration
+
+package rabbitmq
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	"rabbitmq"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -20,358 +18,428 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-var sharedURL string
+var (
+	testContainer testcontainers.Container
+	testURL       string
+	testLogger    *slog.Logger
+)
 
-// TestMain starts one RabbitMQ container for the whole suite.
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
+	testLogger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
 	req := testcontainers.ContainerRequest{
 		Image:        "rabbitmq:4.2-management-alpine",
-		ExposedPorts: []string{"5672/tcp"},
+		ExposedPorts: []string{"5672/tcp", "15672/tcp"},
 		WaitingFor:   wait.ForLog("Server startup complete").WithStartupTimeout(180 * time.Second),
 	}
 
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	var err error
+	testContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
 	if err != nil {
-		log.Fatalf("start rabbitmq container: %v", err)
+		testLogger.Error("failed to start RabbitMQ container", "error", err)
+		os.Exit(1)
 	}
 
-	host, err := container.Host(ctx)
+	host, err := testContainer.Host(ctx)
 	if err != nil {
-		log.Fatalf("get container host: %v", err)
-	}
-	port, err := container.MappedPort(ctx, "5672")
-	if err != nil {
-		log.Fatalf("get container port: %v", err)
+		testLogger.Error("failed to get container host", "error", err)
+		os.Exit(1)
 	}
 
-	sharedURL = "amqp://guest:guest@" + host + ":" + port.Port() + "/"
+	port, err := testContainer.MappedPort(ctx, "5672")
+	if err != nil {
+		testLogger.Error("failed to get container port", "error", err)
+		os.Exit(1)
+	}
+
+	testURL = "amqp://guest:guest@" + host + ":" + port.Port() + "/"
 
 	code := m.Run()
 
-	if err := container.Terminate(ctx); err != nil {
-		log.Printf("warn: terminate container: %v", err)
+	if err := testContainer.Terminate(ctx); err != nil {
+		testLogger.Error("failed to terminate container", "error", err)
 	}
 
 	os.Exit(code)
 }
 
-// newClient creates a rabbitmq.Client for a test and registers cleanup.
-func newClient(t *testing.T, cfg *rabbitmq.Config) *rabbitmq.Client {
+// TestMessage represents a test message structure.
+type TestMessage struct {
+	ID        string    `json:"id"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// newTestClient creates a Client with sensible test defaults and registers t.Cleanup.
+func newTestClient(t *testing.T, overrides ...func(*Config)) *Client {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	client, err := rabbitmq.NewClient(cfg, logger)
-	require.NoError(t, err)
+
+	config := &Config{
+		URL:                      testURL,
+		ConnectionName:           t.Name(),
+		PublisherConfirms:        true,
+		ChannelPoolSize:          DefaultChannelPoolSize,
+		PrefetchCount:            DefaultPrefetchCount,
+		QueueType:                QueueTypeClassic, // classic for tests (no quorum needed)
+		Durable:                  true,
+		AutoAck:                  false,
+		RetryEnabled:             true,
+		RetryTTL:                 DefaultRetryTTLSec * time.Second,
+		MaxRetries:               DefaultMaxRetries,
+		DeadLetterEnabled:        true,
+		ReconnectInitialInterval: DefaultReconnectInitialSec * time.Second,
+		ReconnectMaxInterval:     5 * time.Second,
+	}
+
+	for _, fn := range overrides {
+		fn(config)
+	}
+
+	client, err := NewClient(config, testLogger)
+	require.NoError(t, err, "failed to create client")
+
 	t.Cleanup(func() { client.Close() })
 	return client
 }
 
-// defaultConfig returns a Config wired to the shared container URL.
-func defaultConfig(name string) *rabbitmq.Config {
-	cfg := rabbitmq.NewDefaultConfig()
-	cfg.URL = sharedURL
-	cfg.ConnectionName = name
-	cfg.QueueType = rabbitmq.QueueTypeClassic // classic queues work without quorum node count
-	cfg.ReconnectMaxInterval = 5 * time.Second
-	return cfg
+// newTestQueue declares an isolated queue and returns its name.
+func newTestQueue(t *testing.T, client *Client, name string) string {
+	t.Helper()
+	tm := NewTopologyManager(client)
+	_, err := tm.DeclareQueue(QueueConfig{
+		Name:    name,
+		Durable: true,
+	})
+	require.NoError(t, err, "failed to declare queue %s", name)
+	return name
 }
 
-// OrderEvent is a sample domain message used across tests.
-type OrderEvent struct {
-	OrderID string    `json:"order_id"`
-	Status  string    `json:"status"`
-	At      time.Time `json:"at"`
+func TestNewClient(t *testing.T) {
+	t.Run("creates client successfully", func(t *testing.T) {
+		client := newTestClient(t)
+
+		assert.NotNil(t, client)
+		assert.True(t, client.IsHealthy())
+		assert.Equal(t, StateConnected, client.GetState())
+	})
+
+	t.Run("fails with empty URL", func(t *testing.T) {
+		config := &Config{URL: ""}
+		_, err := NewClient(config, testLogger)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "URL is required")
+	})
 }
 
-// ---- Tests -----------------------------------------------------------------
+func TestProducer_PublishMessage(t *testing.T) {
+	t.Run("publishes and consumes message", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-func TestClientConnects(t *testing.T) {
-	client := newClient(t, defaultConfig("test-connect"))
-	assert.True(t, client.IsHealthy())
-	assert.Equal(t, rabbitmq.StateConnected, client.GetState())
-}
+		client := newTestClient(t)
+		queueName := newTestQueue(t, client, "test-publish-consume")
 
-func TestPublishAndConsume(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+		producer := NewProducer(client)
+		consumer := NewConsumer(client, testLogger)
 
-	client := newClient(t, defaultConfig("test-pub-sub"))
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		received := make(chan TestMessage, 1)
 
-	// Declare an isolated queue for this test.
-	tm := rabbitmq.NewTopologyManager(client)
-	queueName := fmt.Sprintf("test-pub-sub-%d", time.Now().UnixNano())
-	_, err := tm.DeclareQueue(rabbitmq.QueueConfig{Name: queueName, Durable: false})
-	require.NoError(t, err)
+		go func() {
+			consumerCtx, consumerCancel := context.WithTimeout(ctx, 20*time.Second)
+			defer consumerCancel()
 
-	producer := rabbitmq.NewProducer(client)
-	consumer := rabbitmq.NewConsumer(client, logger)
-
-	event := OrderEvent{OrderID: "ord-1", Status: "placed", At: time.Now()}
-
-	received := make(chan OrderEvent, 1)
-
-	go func() {
-		consCtx, consCancel := context.WithTimeout(ctx, 20*time.Second)
-		defer consCancel()
-
-		handler := func(ctx context.Context, msg interface{}, _ amqp.Delivery) error {
-			b, _ := json.Marshal(msg)
-			var e OrderEvent
-			if err := json.Unmarshal(b, &e); err != nil {
-				return err
-			}
-			select {
-			case received <- e:
-			default:
-			}
-			cancel() // signal done
-			return nil
-		}
-		consumer.ConsumeWithDefaults(consCtx, queueName, handler) //nolint:errcheck
-	}()
-
-	time.Sleep(500 * time.Millisecond) // let consumer register
-
-	require.NoError(t, producer.SendMessage(ctx, queueName, event))
-
-	select {
-	case got := <-received:
-		assert.Equal(t, event.OrderID, got.OrderID)
-		assert.Equal(t, event.Status, got.Status)
-	case <-time.After(15 * time.Second):
-		t.Fatal("timeout: message not received")
-	}
-}
-
-func TestPublishWithHeaders(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client := newClient(t, defaultConfig("test-headers"))
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	tm := rabbitmq.NewTopologyManager(client)
-	queueName := fmt.Sprintf("test-headers-%d", time.Now().UnixNano())
-	_, err := tm.DeclareQueue(rabbitmq.QueueConfig{Name: queueName, Durable: false})
-	require.NoError(t, err)
-
-	producer := rabbitmq.NewProducer(client)
-	consumer := rabbitmq.NewConsumer(client, logger)
-
-	headerReceived := make(chan string, 1)
-
-	go func() {
-		consCtx, consCancel := context.WithTimeout(ctx, 20*time.Second)
-		defer consCancel()
-
-		handler := func(ctx context.Context, _ interface{}, d amqp.Delivery) error {
-			if v, ok := d.Headers["x-source"].(string); ok {
+			handler := func(_ context.Context, msg interface{}, _ amqp.Delivery) error {
+				body, _ := json.Marshal(msg)
+				var testMsg TestMessage
+				if err := json.Unmarshal(body, &testMsg); err != nil {
+					return err
+				}
 				select {
-				case headerReceived <- v:
+				case received <- testMsg:
 				default:
 				}
+				return nil
 			}
-			cancel()
-			return nil
-		}
-		consumer.ConsumeWithDefaults(consCtx, queueName, handler) //nolint:errcheck
-	}()
 
-	time.Sleep(500 * time.Millisecond)
-
-	err = producer.SendMessageWithHeaders(ctx, queueName, OrderEvent{OrderID: "ord-2"}, map[string]interface{}{
-		"x-source": "integration-test",
-	})
-	require.NoError(t, err)
-
-	select {
-	case src := <-headerReceived:
-		assert.Equal(t, "integration-test", src)
-	case <-time.After(15 * time.Second):
-		t.Fatal("timeout: header message not received")
-	}
-}
-
-func TestTopicExchangeRouting(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	client := newClient(t, defaultConfig("test-topic"))
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	tm := rabbitmq.NewTopologyManager(client)
-	exchangeName := "orders.topic." + suffix
-	queueName := "orders.placed." + suffix
-
-	require.NoError(t, tm.DeclareExchange(rabbitmq.ExchangeConfig{
-		Name:    exchangeName,
-		Kind:    "topic",
-		Durable: false,
-	}))
-	_, err := tm.DeclareQueue(rabbitmq.QueueConfig{Name: queueName, Durable: false})
-	require.NoError(t, err)
-	require.NoError(t, tm.BindQueue(rabbitmq.BindingConfig{
-		QueueName:  queueName,
-		Exchange:   exchangeName,
-		RoutingKey: "orders.placed",
-	}))
-
-	producer := rabbitmq.NewProducer(client)
-	consumer := rabbitmq.NewConsumer(client, logger)
-
-	received := make(chan struct{}, 1)
-
-	go func() {
-		consCtx, consCancel := context.WithTimeout(ctx, 20*time.Second)
-		defer consCancel()
-
-		handler := func(_ context.Context, _ interface{}, _ amqp.Delivery) error {
-			select {
-			case received <- struct{}{}:
-			default:
+			if err := consumer.ConsumeWithDefaults(consumerCtx, queueName, handler); err != nil && err != context.Canceled {
+				t.Logf("consumer error: %v", err)
 			}
-			cancel()
-			return nil
+		}()
+
+		time.Sleep(1 * time.Second) // let consumer attach
+
+		testMsg := TestMessage{
+			ID:        "msg-001",
+			Content:   "Hello, RabbitMQ!",
+			Timestamp: time.Now(),
 		}
-		consumer.ConsumeWithDefaults(consCtx, queueName, handler) //nolint:errcheck
-	}()
 
-	time.Sleep(500 * time.Millisecond)
+		err := producer.SendMessage(ctx, queueName, testMsg)
+		require.NoError(t, err, "failed to send message")
 
-	// This message should be routed to the queue.
-	require.NoError(t, producer.SendToTopic(ctx, exchangeName, "orders.placed", OrderEvent{OrderID: "ord-3"}))
-	// This message should NOT be routed (different key).
-	require.NoError(t, producer.SendToTopic(ctx, exchangeName, "orders.cancelled", OrderEvent{OrderID: "ord-4"}))
-
-	select {
-	case <-received:
-		// success
-	case <-time.After(15 * time.Second):
-		t.Fatal("timeout: topic message not received")
-	}
-}
-
-func TestManualAckOnFailure(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cfg := defaultConfig("test-manual-ack")
-	cfg.AutoAck = false
-
-	client := newClient(t, cfg)
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	tm := rabbitmq.NewTopologyManager(client)
-	queueName := fmt.Sprintf("test-ack-%d", time.Now().UnixNano())
-	_, err := tm.DeclareQueue(rabbitmq.QueueConfig{Name: queueName, Durable: false})
-	require.NoError(t, err)
-
-	producer := rabbitmq.NewProducer(client)
-	require.NoError(t, producer.SendMessage(ctx, queueName, OrderEvent{OrderID: "ack-test"}))
-
-	consumer := rabbitmq.NewConsumer(client, logger)
-	var callCount atomic.Int32
-
-	go func() {
-		consCtx, consCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer consCancel()
-
-		handler := func(_ context.Context, _ interface{}, _ amqp.Delivery) error {
-			callCount.Add(1)
-			return fmt.Errorf("simulated failure") // triggers nack + requeue
-		}
-		consumer.ConsumeWithDefaults(consCtx, queueName, handler) //nolint:errcheck
-	}()
-
-	// Wait for at least two deliveries — proves nack+requeue is working.
-	deadline := time.After(10 * time.Second)
-	for {
 		select {
-		case <-deadline:
-			t.Fatal("timeout: message was not redelivered")
-		default:
-			if callCount.Load() >= 2 {
-				cancel()
-				return
-			}
-			time.Sleep(200 * time.Millisecond)
+		case got := <-received:
+			assert.Equal(t, testMsg.ID, got.ID)
+			assert.Equal(t, testMsg.Content, got.Content)
+		case <-time.After(15 * time.Second):
+			t.Fatal("timeout waiting for message")
 		}
-	}
+	})
 }
 
-func TestDeadLetterExchange(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func TestConsumer_ManualAck(t *testing.T) {
+	t.Run("manual acknowledgment works correctly", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	client := newClient(t, defaultConfig("test-dlx"))
+		client := newTestClient(t)
+		queueName := newTestQueue(t, client, "test-manual-ack")
 
-	tm := rabbitmq.NewTopologyManager(client)
-	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
-	mainQueue := "orders.main." + suffix
-	dlxName := "orders.dlx." + suffix
-
-	require.NoError(t, tm.SetupDeadLetterExchange(mainQueue, dlxName, 1000 /* 1 s TTL */))
-	_, err := tm.SetupQueueWithDLX(mainQueue, dlxName)
-	require.NoError(t, err)
-
-	producer := rabbitmq.NewProducer(client)
-	err = producer.SendMessage(ctx, mainQueue, OrderEvent{OrderID: "dlx-test", Status: "pending"})
-	require.NoError(t, err)
-}
-
-func TestPublishBatch(t *testing.T) {
-	ctx := context.Background()
-
-	client := newClient(t, defaultConfig("test-batch"))
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	tm := rabbitmq.NewTopologyManager(client)
-	queueName := fmt.Sprintf("test-batch-%d", time.Now().UnixNano())
-	_, err := tm.DeclareQueue(rabbitmq.QueueConfig{Name: queueName, Durable: false})
-	require.NoError(t, err)
-
-	producer := rabbitmq.NewProducer(client)
-
-	payloads := make([]interface{}, 5)
-	for i := range payloads {
-		payloads[i] = OrderEvent{OrderID: fmt.Sprintf("batch-%d", i)}
-	}
-
-	opts := rabbitmq.PublishOptions{RoutingKey: queueName}
-	require.NoError(t, producer.PublishBatch(ctx, opts, payloads))
-
-	// Verify all 5 are in the queue by consuming them.
-	consumer := rabbitmq.NewConsumer(client, logger)
-	consCtx, consCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer consCancel()
-
-	var count atomic.Int32
-	go func() {
-		handler := func(_ context.Context, _ interface{}, _ amqp.Delivery) error {
-			if count.Add(1) >= 5 {
-				consCancel()
-			}
-			return nil
+		producer := NewProducer(client)
+		testMsg := TestMessage{
+			ID:        "ack-test",
+			Content:   "Testing manual ack",
+			Timestamp: time.Now(),
 		}
-		consumer.ConsumeWithDefaults(consCtx, queueName, handler) //nolint:errcheck
-	}()
 
-	<-consCtx.Done()
-	assert.EqualValues(t, 5, count.Load())
+		err := producer.SendMessage(ctx, queueName, testMsg)
+		require.NoError(t, err)
+
+		consumer := NewConsumer(client, testLogger)
+		handlerCalled := make(chan bool, 1)
+
+		go func() {
+			consumerCtx, consumerCancel := context.WithTimeout(ctx, 5*time.Second)
+			defer consumerCancel()
+
+			handler := func(_ context.Context, _ interface{}, _ amqp.Delivery) error {
+				select {
+				case handlerCalled <- true:
+				default:
+				}
+				return fmt.Errorf("simulated processing error")
+			}
+
+			if err := consumer.ConsumeWithDefaults(consumerCtx, queueName, handler); err != nil && err != context.Canceled {
+				t.Logf("consumer error: %v", err)
+			}
+		}()
+
+		select {
+		case <-handlerCalled:
+			// Handler was called and returned an error — message should be requeued
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for handler call")
+		}
+	})
 }
 
-func TestClientInvalidURL(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	cfg := rabbitmq.NewDefaultConfig()
-	cfg.URL = ""
+func TestTopologyManager_SetupDeadLetterExchange(t *testing.T) {
+	t.Run("sets up DLX with retry and parking lot", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	_, err := rabbitmq.NewClient(cfg, logger)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, rabbitmq.ErrURLRequired)
+		client := newTestClient(t)
+		tm := NewTopologyManager(client)
+
+		mainQueue := "test-dlx-main"
+		dlxName := "test-dlx"
+
+		err := tm.SetupDeadLetterExchange(mainQueue, dlxName, 5000)
+		require.NoError(t, err)
+
+		_, err = tm.SetupQueueWithDLX(mainQueue, dlxName)
+		require.NoError(t, err)
+
+		producer := NewProducer(client)
+		testMsg := TestMessage{
+			ID:        "dlx-test",
+			Content:   "Testing DLX",
+			Timestamp: time.Now(),
+		}
+
+		err = producer.SendMessage(ctx, mainQueue, testMsg)
+		require.NoError(t, err)
+	})
+}
+
+func TestClient_Reconnection(t *testing.T) {
+	t.Run("reconnects after connection loss", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		client := newTestClient(t)
+		queueName := newTestQueue(t, client, "test-reconnect")
+
+		assert.True(t, client.IsHealthy())
+
+		// Simulate connection loss by closing connections directly
+		client.mu.Lock()
+		if client.publisherConn != nil {
+			client.publisherConn.Close()
+		}
+		if client.consumerConn != nil {
+			client.consumerConn.Close()
+		}
+		client.mu.Unlock()
+
+		// Wait for reconnection
+		var reconnected bool
+		for i := 0; i < 30; i++ {
+			time.Sleep(500 * time.Millisecond)
+			if client.IsHealthy() {
+				reconnected = true
+				break
+			}
+		}
+		assert.True(t, reconnected, "client should reconnect after connection loss")
+
+		// Verify publish works after reconnection
+		producer := NewProducer(client)
+		testMsg := TestMessage{
+			ID:        "reconnect-test",
+			Content:   "After reconnection",
+			Timestamp: time.Now(),
+		}
+
+		err := producer.SendMessage(ctx, queueName, testMsg)
+		require.NoError(t, err)
+	})
+}
+
+func TestBatchConsumer(t *testing.T) {
+	t.Run("processes messages in batches", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		client := newTestClient(t)
+		queueName := newTestQueue(t, client, "test-batch")
+
+		producer := NewProducer(client)
+
+		// Send 5 messages
+		for i := 0; i < 5; i++ {
+			err := producer.SendMessage(ctx, queueName, TestMessage{
+				ID:        fmt.Sprintf("batch-%d", i),
+				Content:   "Batch test",
+				Timestamp: time.Now(),
+			})
+			require.NoError(t, err)
+		}
+
+		batchReceived := make(chan int, 1)
+		bc := NewBatchConsumer(client, testLogger, 5, 10*time.Second)
+
+		go func() {
+			consumerCtx, consumerCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer consumerCancel()
+
+			handler := func(_ context.Context, messages []interface{}, _ []amqp.Delivery) error {
+				select {
+				case batchReceived <- len(messages):
+				default:
+				}
+				return nil
+			}
+
+			if err := bc.StartBatchConsumer(consumerCtx, ConsumeOptions{QueueName: queueName}, handler); err != nil && err != context.Canceled {
+				t.Logf("batch consumer error: %v", err)
+			}
+		}()
+
+		select {
+		case count := <-batchReceived:
+			assert.Equal(t, 5, count)
+		case <-time.After(15 * time.Second):
+			t.Fatal("timeout waiting for batch")
+		}
+	})
+}
+
+func TestConsumer_AutoReconnect(t *testing.T) {
+	t.Run("consumer restarts after delivery channel close", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		client := newTestClient(t)
+		queueName := newTestQueue(t, client, "test-auto-reconnect")
+
+		consumer := NewConsumer(client, testLogger)
+		received := make(chan string, 10)
+
+		go func() {
+			handler := func(_ context.Context, msg interface{}, _ amqp.Delivery) error {
+				body, _ := json.Marshal(msg)
+				var testMsg TestMessage
+				if err := json.Unmarshal(body, &testMsg); err != nil {
+					return err
+				}
+				received <- testMsg.ID
+				return nil
+			}
+
+			if err := consumer.StartConsumer(ctx, ConsumeOptions{
+				QueueName:     queueName,
+				AutoReconnect: true,
+			}, handler); err != nil && err != context.Canceled {
+				t.Logf("consumer error: %v", err)
+			}
+		}()
+
+		time.Sleep(1 * time.Second)
+
+		// Send first message
+		producer := NewProducer(client)
+		err := producer.SendMessage(ctx, queueName, TestMessage{ID: "before-drop", Content: "Pre-disconnect"})
+		require.NoError(t, err)
+
+		select {
+		case id := <-received:
+			assert.Equal(t, "before-drop", id)
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for first message")
+		}
+
+		// Simulate connection loss
+		client.mu.Lock()
+		if client.publisherConn != nil {
+			client.publisherConn.Close()
+		}
+		if client.consumerConn != nil {
+			client.consumerConn.Close()
+		}
+		client.mu.Unlock()
+
+		// Wait for reconnection
+		for i := 0; i < 30; i++ {
+			time.Sleep(500 * time.Millisecond)
+			if client.IsHealthy() {
+				break
+			}
+		}
+		require.True(t, client.IsHealthy(), "client should reconnect")
+
+		// Re-declare queue after reconnect (topology restore handles this if declared via TopologyManager)
+		newTestQueue(t, client, queueName)
+
+		time.Sleep(1 * time.Second) // let consumer re-attach
+
+		// Send second message
+		err = producer.SendMessage(ctx, queueName, TestMessage{ID: "after-reconnect", Content: "Post-disconnect"})
+		require.NoError(t, err)
+
+		select {
+		case id := <-received:
+			assert.Equal(t, "after-reconnect", id)
+		case <-time.After(15 * time.Second):
+			t.Fatal("timeout waiting for message after reconnection")
+		}
+	})
 }

@@ -40,7 +40,7 @@ type TopologyDeclarer interface {
 	SetupQueueWithDLX(queueName, dlxName string) (*amqp.Queue, error)
 }
 
-// ConnectionState represents the current state of the connection
+// ConnectionState represents the current state of the connection.
 type ConnectionState int32
 
 const (
@@ -50,29 +50,25 @@ const (
 	StateClosing
 )
 
-// Client manages RabbitMQ connections with auto-reconnection
+// Client manages RabbitMQ connections with auto-reconnection.
 type Client struct {
 	config *Config
 	logger *slog.Logger
 
-	// Connections
 	publisherConn *amqp.Connection
 	consumerConn  *amqp.Connection
 
-	// Channel pools
-	publisherChannels chan *amqp.Channel
+	publisherPool *channelPool
 
-	// State management
 	state     atomic.Int32
 	closeChan chan struct{}
 
-	// Topology cache for reconnection
 	topology *TopologyCache
 
 	mu sync.RWMutex
 }
 
-// TopologyCache stores declared queues, exchanges, and bindings for reconnection
+// TopologyCache stores declared queues, exchanges, and bindings for reconnection.
 type TopologyCache struct {
 	queues    []QueueConfig
 	exchanges []ExchangeConfig
@@ -80,22 +76,21 @@ type TopologyCache struct {
 	mu        sync.RWMutex
 }
 
-// NewClient creates a new RabbitMQ client with auto-reconnection
+// NewClient creates a new RabbitMQ client with auto-reconnection.
 func NewClient(config *Config, logger *slog.Logger) (*Client, error) {
 	if config == nil {
 		return nil, fmt.Errorf("rabbitmq: config nil")
 	}
 
-	// Apply defaults for any unset values, returns error if required fields are missing
 	if err := config.ApplyDefaults(); err != nil {
 		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
 
 	client := &Client{
-		config:            config,
-		logger:            logger,
-		publisherChannels: make(chan *amqp.Channel, config.ChannelPoolSize),
-		closeChan:         make(chan struct{}),
+		config:        config,
+		logger:        logger,
+		publisherPool: newChannelPool(config.ChannelPoolSize),
+		closeChan:     make(chan struct{}),
 		topology: &TopologyCache{
 			queues:    make([]QueueConfig, 0),
 			exchanges: make([]ExchangeConfig, 0),
@@ -105,7 +100,6 @@ func NewClient(config *Config, logger *slog.Logger) (*Client, error) {
 
 	client.state.Store(int32(StateDisconnected))
 
-	// Initial connection
 	if err := client.connect(); err != nil {
 		return nil, fmt.Errorf("rabbitmq: initial connection failed: %w", err)
 	}
@@ -113,7 +107,7 @@ func NewClient(config *Config, logger *slog.Logger) (*Client, error) {
 	return client, nil
 }
 
-// connect establishes initial connections
+// connect establishes publisher and consumer connections and fills the channel pool.
 func (c *Client) connect() error {
 	c.state.Store(int32(StateConnecting))
 
@@ -121,22 +115,24 @@ func (c *Client) connect() error {
 	if err != nil {
 		return fmt.Errorf("publisher connection failed: %w", err)
 	}
-	c.publisherConn = pubConn
 
 	consConn, err := c.dial("consumer")
 	if err != nil {
-		c.publisherConn.Close()
+		pubConn.Close()
 		return fmt.Errorf("consumer connection failed: %w", err)
 	}
+
+	// Hold mutex while assigning connection pointers
+	c.mu.Lock()
+	c.publisherConn = pubConn
 	c.consumerConn = consConn
+	c.mu.Unlock()
 
-	// Clear any old channels from pools before reinitializing
-	c.clearChannelPools()
-
-	// Initialize channel pools
-	if err := c.initializeChannelPools(); err != nil {
-		c.publisherConn.Close()
-		c.consumerConn.Close()
+	// Drain stale channels and fill pool from the new connection
+	c.publisherPool.drain()
+	if err := c.publisherPool.fill(pubConn, c.config.PublisherConfirms); err != nil {
+		pubConn.Close()
+		consConn.Close()
 		return fmt.Errorf("channel pool initialization failed: %w", err)
 	}
 
@@ -150,7 +146,7 @@ func (c *Client) connect() error {
 	return nil
 }
 
-// dial creates a new connection with the given name
+// dial creates a new AMQP connection with a named connection type.
 func (c *Client) dial(connType string) (*amqp.Connection, error) {
 	config := amqp.Config{
 		Locale: "en_US",
@@ -167,13 +163,13 @@ func (c *Client) dial(connType string) (*amqp.Connection, error) {
 	return conn, nil
 }
 
-// setupNotifyHandlers sets up NotifyClose handlers for both connections
+// setupNotifyHandlers registers NotifyClose handlers for both connections.
 func (c *Client) setupNotifyHandlers() {
 	go c.handleConnectionClose(c.publisherConn, "publisher")
 	go c.handleConnectionClose(c.consumerConn, "consumer")
 }
 
-// handleConnectionClose handles individual connection close events
+// handleConnectionClose watches for a connection close event and triggers reconnection.
 func (c *Client) handleConnectionClose(conn *amqp.Connection, connType string) {
 	notifyClose := conn.NotifyClose(make(chan *amqp.Error, 1))
 
@@ -181,22 +177,20 @@ func (c *Client) handleConnectionClose(conn *amqp.Connection, connType string) {
 	case <-c.closeChan:
 		return
 	case err, ok := <-notifyClose:
-		// Trigger reconnection when channel closes or error occurs
 		if !ok || err != nil {
 			c.logger.Warn("rabbitmq connection closed",
 				"connection_type", connType,
 				"error", err,
 			)
-			// Clear channel pools in a separate goroutine to avoid blocking
 			go func() {
-				c.clearChannelPools()
+				c.publisherPool.drain()
 				c.triggerReconnect()
 			}()
 		}
 	}
 }
 
-// triggerReconnect initiates reconnection if not already connecting/closing
+// triggerReconnect initiates reconnection if not already connecting or closing.
 func (c *Client) triggerReconnect() {
 	for {
 		currentState := c.state.Load()
@@ -217,28 +211,7 @@ func (c *Client) triggerReconnect() {
 	}
 }
 
-// initializeChannelPools creates initial channel pools
-func (c *Client) initializeChannelPools() error {
-	// Initialize publisher channels with confirms
-	for i := 0; i < c.config.ChannelPoolSize; i++ {
-		ch, err := c.publisherConn.Channel()
-		if err != nil {
-			return fmt.Errorf("failed to create publisher channel: %w", err)
-		}
-
-		if c.config.PublisherConfirms {
-			if err := ch.Confirm(false); err != nil {
-				return fmt.Errorf("failed to enable publisher confirms: %w", err)
-			}
-		}
-
-		c.publisherChannels <- ch
-	}
-
-	return nil
-}
-
-// reconnectWithBackoff handles reconnection with exponential backoff
+// reconnectWithBackoff handles reconnection with exponential backoff.
 func (c *Client) reconnectWithBackoff() {
 	backoff := c.config.ReconnectInitialInterval
 	maxBackoff := c.config.ReconnectMaxInterval
@@ -257,9 +230,6 @@ func (c *Client) reconnectWithBackoff() {
 
 			c.logger.Info("attempting reconnection", "backoff", backoff)
 
-			// Clear old channels before reconnecting
-			c.clearChannelPools()
-
 			if err := c.connect(); err != nil {
 				c.logger.Error("reconnection attempt failed", "error", err, "next_backoff", backoff*2)
 
@@ -275,50 +245,37 @@ func (c *Client) reconnectWithBackoff() {
 			}
 
 			c.logger.Info("reconnection successful")
-			c.state.Store(int32(StateConnected))
 			return
 		}
 	}
 }
 
-// GetPublisherChannel returns a channel from the publisher pool
-func (c *Client) GetPublisherChannel() (*amqp.Channel, error) {
+// GetPublisherChannel returns a channel from the publisher pool.
+// The context controls how long the caller waits for a channel to become available.
+func (c *Client) GetPublisherChannel(ctx context.Context) (*amqp.Channel, error) {
 	if c.state.Load() != int32(StateConnected) {
 		return nil, ErrNotConnected
 	}
 
-	select {
-	case ch := <-c.publisherChannels:
-		if ch != nil && !ch.IsClosed() {
-			return ch, nil
-		}
-		return nil, fmt.Errorf("channel is closed, retry connection")
-	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for publisher channel")
-	}
+	return c.publisherPool.get(ctx)
 }
 
-// ReturnPublisherChannel returns a channel to the publisher pool
+// ReturnPublisherChannel returns a channel to the publisher pool.
 func (c *Client) ReturnPublisherChannel(ch *amqp.Channel) {
-	if ch == nil || ch.IsClosed() {
-		return
-	}
-
-	select {
-	case c.publisherChannels <- ch:
-	default:
-		// Pool is full, close the channel
-		ch.Close()
-	}
+	c.publisherPool.returnCh(ch)
 }
 
-// CreateConsumerChannel creates a new consumer channel for the given connection
+// CreateConsumerChannel creates a new channel on the consumer connection.
 func (c *Client) CreateConsumerChannel() (*amqp.Channel, error) {
 	if c.state.Load() != int32(StateConnected) {
 		return nil, ErrNotConnected
 	}
 
-	ch, err := c.consumerConn.Channel()
+	c.mu.RLock()
+	conn := c.consumerConn
+	c.mu.RUnlock()
+
+	ch, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consumer channel: %w", err)
 	}
@@ -326,39 +283,13 @@ func (c *Client) CreateConsumerChannel() (*amqp.Channel, error) {
 	return ch, nil
 }
 
-// clearChannelPools drains and closes all channels in the publisher pool
-func (c *Client) clearChannelPools() {
-	// Drain publisher channels
-	drainChannelPool(c.publisherChannels)
-}
-
-// drainChannelPool drains and closes all channels in a pool
-func drainChannelPool(pool chan *amqp.Channel) {
-	for {
-		select {
-		case ch := <-pool:
-			if ch != nil && !ch.IsClosed() {
-				ch.Close()
-			}
-		default:
-			// Pool is empty
-			return
-		}
-	}
-}
-
-// Close gracefully closes all connections
+// Close gracefully shuts down all connections and the channel pool.
 func (c *Client) Close() error {
 	c.state.Store(int32(StateClosing))
 	close(c.closeChan)
 
-	close(c.publisherChannels)
+	c.publisherPool.close()
 
-	for ch := range c.publisherChannels {
-		ch.Close()
-	}
-
-	// Close connections
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -374,12 +305,12 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// IsHealthy returns true if the client is connected and healthy
+// IsHealthy returns true if the client is connected and healthy.
 func (c *Client) IsHealthy() bool {
 	return c.state.Load() == int32(StateConnected)
 }
 
-// GetState returns the current connection state
+// GetState returns the current connection state.
 func (c *Client) GetState() ConnectionState {
 	return ConnectionState(c.state.Load())
 }

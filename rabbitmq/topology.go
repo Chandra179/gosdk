@@ -117,36 +117,37 @@ func (tm *TopologyManager) BindQueue(config BindingConfig) error {
 	return nil
 }
 
-// restoreTopology re-declares all cached topology after reconnection
+// restoreTopology re-declares all cached topology after reconnection.
+// It resets the cache before re-declaring so entries are not duplicated on each reconnect.
 func (c *Client) restoreTopology() error {
-	// Snapshot topology while holding mutex
-	c.topology.mu.RLock()
+	// Snapshot and reset cache atomically so DeclareQueue/Exchange/BindQueue
+	// re-populate with exactly the same entries (no unbounded growth).
+	c.topology.mu.Lock()
 	exchanges := make([]ExchangeConfig, len(c.topology.exchanges))
 	queues := make([]QueueConfig, len(c.topology.queues))
 	bindings := make([]BindingConfig, len(c.topology.bindings))
 	copy(exchanges, c.topology.exchanges)
 	copy(queues, c.topology.queues)
 	copy(bindings, c.topology.bindings)
-	c.topology.mu.RUnlock()
+	c.topology.queues = c.topology.queues[:0]
+	c.topology.exchanges = c.topology.exchanges[:0]
+	c.topology.bindings = c.topology.bindings[:0]
+	c.topology.mu.Unlock()
 
-	// Restore topology without holding mutex (DeclareQueue needs client.mu)
 	tm := NewTopologyManager(c)
 
-	// Re-declare exchanges first
 	for _, exchange := range exchanges {
 		if err := tm.DeclareExchange(exchange); err != nil {
 			return err
 		}
 	}
 
-	// Re-declare queues
 	for _, queue := range queues {
 		if _, err := tm.DeclareQueue(queue); err != nil {
 			return err
 		}
 	}
 
-	// Re-create bindings
 	for _, binding := range bindings {
 		if err := tm.BindQueue(binding); err != nil {
 			return err
